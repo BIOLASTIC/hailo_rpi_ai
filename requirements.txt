@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+redis
+jinja2
+pydantic-settings
+opencv-python-headless
+numpy<2.0
+
+# Hailo runtime is installed via .deb package, not pip
+# hailo-platform

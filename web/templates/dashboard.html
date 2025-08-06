@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="row g-4">
+    <!-- Left Column: Raw Feed -->
+    <div class="col-lg-6">
+        <div class="card">
+            <div class="card-header fw-bold">Raw Camera Feed</div>
+            <div class="feed-container">
+                <img id="raw-feed" src="/api/v1/camera/stream/{{ camera_id }}" alt="Raw Camera Feed">
+            </div>
+        </div>
+    </div>
+
+    <!-- Right Column: AI Feed -->
+    <div class="col-lg-6">
+        <div class="card">
+            <div class="card-header fw-bold">AI Annotated Feed</div>
+            <div class="feed-container">
+                <img id="ai-feed" src="/api/v1/ai/stream/{{ camera_id }}" alt="AI Annotated Feed">
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="row mt-4">
+    <div class="col-12">
+        <div class="card">
+            <div class="card-header fw-bold">Live Detections</div>
+            <div class="card-body">
+                <ul class="list-group" id="detections-list">
+                    <li class="list-group-item text-muted">Waiting for detections...</li>
+                </ul>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="/static/js/dashboard.js"></script>
+{% endblock %}
