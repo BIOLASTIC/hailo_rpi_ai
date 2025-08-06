@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+
+{% block title %}Hailo AI Dashboard{% endblock %}
+
+{% block content %}
+<div class="container">
+    <h1>🤖 Hailo AI Live Video Stream</h1>
+    <p class="subtitle">Real-time object detection with comprehensive technical overlays</p>
+    
+    <div class="video-container">
+        <img id="videoStream" 
+             src="/video_feed" 
+             alt="Live AI Video Feed"
+             class="video-stream">
+    </div>
+    
+    <div class="controls">
+        <button class="btn" onclick="refreshStream()">🔄 Refresh</button>
+        <button class="btn" onclick="toggleFullscreen()">📺 Fullscreen</button>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="/static/js/dashboard.js"></script>
+{% endblock %}
