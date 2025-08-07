@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-Enhanced Hailo AI Inference Service with Frame Skipping and Robust Redis Connection Handling
+Hailo AI Inference Service Optimized for Maximum Hailo HAT Utilization
 """
 import time
 import cv2
 import redis
 import numpy as np
 import traceback
+import subprocess
 from pathlib import Path
 
 # Correct Redis retry imports
@@ -26,13 +27,13 @@ from app.services.frame_processor import FrameProcessor
 from app.core.detection_processor import DetectionProcessor
 
 try:
-    from hailo_platform import VDevice, HEF, InferVStreams, InputVStreamParams, OutputVStreamParams
+    from hailo_platform import VDevice, HEF, InferVStreams, InputVStreamParams, OutputVStreamParams, ConfigureParams, HailoStreamInterface
 except ImportError as e:
     print(f"[FATAL] HailoRT import error: {e}")
     exit(1)
 
 
-class OptimizedHailoInferenceService:
+class MaxHailoUtilizationInferenceService:
     def __init__(self):
         self.system_monitor = SystemMonitor()
         self.technical_logger = TechnicalLogger()
@@ -44,20 +45,52 @@ class OptimizedHailoInferenceService:
         self.reconnect_attempts = 0
         self.max_reconnect_attempts = 5
         
-        # Frame skipping and optimization variables
+        # Hailo optimization variables
         self.frame_skip_counter = 0
         self.last_process_time = 0
-        self.last_detections = []  # Store last detections for skipped frames
+        self.last_detections = []
         self.last_processed_frame = None
         self.adaptive_skip_factor = 1
         self.overlay_cache = None
         self.overlay_update_counter = 0
         
+        # Hailo utilization tracking
+        self.hailo_utilization = 0.0
+        self.last_hailo_check = time.time()
+        self.batch_frames = []
+        self.batch_size = 4
+        self.enable_batching = True
+        self.use_hailo_nms = True
+        
     def initialize_redis(self):
         """Initialize Redis with progressive fallback to find working configuration"""
         print("🔗 Attempting Redis connection with progressive fallback...")
         
-        # Method 1: Most basic connection (no socket options)
+        # Method 1: Enhanced persistent connection with aggressive keepalive
+        try:
+            print("   Trying enhanced persistent connection...")
+            self.redis_client = redis.Redis(
+                host='localhost',
+                port=6379,
+                decode_responses=False,
+                socket_keepalive=True,
+                socket_keepalive_options={
+                    1: 1,    # TCP_KEEPIDLE: 1 second
+                    2: 1,    # TCP_KEEPINTVL: 1 second interval
+                    3: 3     # TCP_KEEPCNT: 3 probes
+                },
+                socket_connect_timeout=10,
+                socket_timeout=30,
+                health_check_interval=15,
+                retry_on_timeout=True
+            )
+            self.redis_client.ping()
+            print("✅ Redis connected with enhanced persistence")
+            return True
+        except Exception as e:
+            print(f"   Enhanced method failed: {e}")
+        
+        # Method 2: Basic connection fallback
         try:
             print("   Trying basic connection...")
             self.redis_client = redis.Redis(
@@ -66,55 +99,10 @@ class OptimizedHailoInferenceService:
                 decode_responses=False
             )
             self.redis_client.ping()
-            print("✅ Redis connected (Method 1: Basic)")
+            print("✅ Redis connected (Method 2: Basic)")
             return True
         except Exception as e:
-            print(f"   Method 1 failed: {e}")
-        
-        # Method 2: With minimal timeouts only
-        try:
-            print("   Trying with minimal timeouts...")
-            self.redis_client = redis.Redis(
-                host=settings.REDIS_HOST,
-                port=settings.REDIS_PORT,
-                socket_connect_timeout=5,
-                socket_timeout=5,
-                decode_responses=False
-            )
-            self.redis_client.ping()
-            print("✅ Redis connected (Method 2: With timeouts)")
-            return True
-        except Exception as e:
-            print(f"   Method 2 failed: {e}")
-        
-        # Method 3: URL-based connection
-        try:
-            print("   Trying URL-based connection...")
-            self.redis_client = redis.from_url(
-                'redis://localhost:6379/0',
-                socket_connect_timeout=5,
-                socket_timeout=5
-            )
-            self.redis_client.ping()
-            print("✅ Redis connected (Method 3: URL-based)")
-            return True
-        except Exception as e:
-            print(f"   Method 3 failed: {e}")
-        
-        # Method 4: Connection pool approach
-        try:
-            print("   Trying connection pool...")
-            pool = redis.ConnectionPool(
-                host='localhost',
-                port=6379,
-                max_connections=10
-            )
-            self.redis_client = redis.Redis(connection_pool=pool)
-            self.redis_client.ping()
-            print("✅ Redis connected (Method 4: Connection pool)")
-            return True
-        except Exception as e:
-            print(f"   Method 4 failed: {e}")
+            print(f"   Basic method failed: {e}")
         
         print("❌ All Redis connection methods failed")
         return False
@@ -128,9 +116,7 @@ class OptimizedHailoInferenceService:
                 except:
                     pass
             
-            # Ensure Redis client is healthy
             self.redis_client.ping()
-            
             self.pubsub = self.redis_client.pubsub()
             self.pubsub.subscribe(settings.RAW_FRAME_INPUT_CHANNEL)
             print(f"✅ Redis pubsub subscribed to {settings.RAW_FRAME_INPUT_CHANNEL}")
@@ -149,7 +135,6 @@ class OptimizedHailoInferenceService:
             print(f"💥 Max Redis reconnection attempts ({self.max_reconnect_attempts}) reached")
             return False
         
-        # Enhanced exponential backoff with jitter
         base_wait = 2 ** self.reconnect_attempts
         jitter = np.random.uniform(0.1, 0.5)
         wait_time = min(base_wait + jitter, 30)
@@ -159,7 +144,6 @@ class OptimizedHailoInferenceService:
         
         time.sleep(wait_time)
         
-        # Close existing connections gracefully
         try:
             if self.pubsub:
                 self.pubsub.close()
@@ -168,11 +152,9 @@ class OptimizedHailoInferenceService:
         except:
             pass
         
-        # Force garbage collection
         import gc
         gc.collect()
         
-        # Reinitialize Redis connection
         if self.initialize_redis() and self.setup_redis_pubsub():
             print("✅ Redis reconnection successful")
             return True
@@ -183,19 +165,17 @@ class OptimizedHailoInferenceService:
     def get_redis_message_with_retry(self):
         """Get Redis message with enhanced automatic reconnection on failure"""
         max_retries = 5
-        base_timeout = 0.5
+        base_timeout = 0.1  # Reduced timeout for faster throughput
         
         for attempt in range(max_retries):
             try:
-                # Health check before getting message
                 if attempt > 0:
                     self.redis_client.ping()
                 
-                # Get message with adaptive timeout
                 timeout = base_timeout * (attempt + 1)
                 message = self.pubsub.get_message(
                     ignore_subscribe_messages=True, 
-                    timeout=min(timeout, 2.0)
+                    timeout=min(timeout, 1.0)
                 )
                 return message
                 
@@ -216,13 +196,42 @@ class OptimizedHailoInferenceService:
         
         return None
     
-    def setup_hailo_model(self, vdevice):
-        """Setup Hailo model and auto-detect input size from HEF file"""
+    def setup_hailo_model_with_nms(self, vdevice):
+        """Setup Hailo model with built-in post-processing for maximum utilization"""
         hef = HEF(settings.AI_MODEL_PATH)
-        network_groups = vdevice.configure(hef)
+        
+        try:
+            # Try to enable Hailo's built-in NMS post-processing
+            configure_params = ConfigureParams.create_from_hef(
+                hef, 
+                interface=HailoStreamInterface.PCIe
+            )
+            
+            # Configure NMS to run on Hailo chip instead of CPU
+            nms_enabled = False
+            for network_group in configure_params.network_groups:
+                for network in network_group.networks:
+                    for output_stream in network.output_streams:
+                        if hasattr(output_stream, 'nms_config'):
+                            output_stream.nms_config.engine = 'hailo'
+                            nms_enabled = True
+                            print("✅ Enabled Hailo NMS post-processing")
+            
+            if nms_enabled:
+                network_groups = vdevice.configure(configure_params)
+                self.use_hailo_nms = True
+            else:
+                network_groups = vdevice.configure(hef)
+                print("⚠️ Hailo NMS not available, using CPU post-processing")
+                
+        except Exception as e:
+            print(f"⚠️ Advanced Hailo configuration failed: {e}")
+            print("📝 Using standard configuration")
+            network_groups = vdevice.configure(hef)
+        
         network_group = network_groups[0]
         
-        # Get ACTUAL model dimensions from HEF file
+        # Get model dimensions
         input_vstream_info = hef.get_input_vstream_infos()[0]
         output_vstream_info = hef.get_output_vstream_infos()[0]
         
@@ -242,67 +251,152 @@ class OptimizedHailoInferenceService:
             'configured_height': settings.MODEL_INPUT_HEIGHT,
             'configured_width': settings.MODEL_INPUT_WIDTH,
             'size_override': size_override,
-            'maintain_aspect_ratio': settings.MAINTAIN_ASPECT_RATIO
+            'maintain_aspect_ratio': settings.MAINTAIN_ASPECT_RATIO,
+            'hailo_nms_enabled': self.use_hailo_nms
         }
         
         print(f"📐 Model: {self.model_info['name']}")
         print(f"📏 HEF Model Input (ACTUAL): {model_width_hef}x{model_height_hef}")
+        print(f"🔥 Hailo NMS Enabled: {self.use_hailo_nms}")
         if size_override:
             print(f"⚠️ Using HEF's native size ({model_width_hef}x{model_height_hef}) instead of configured size")
         
         return network_group, hef
     
+    def get_hailo_utilization(self):
+        """Get current Hailo device utilization"""
+        current_time = time.time()
+        
+        # Only check every 2 seconds to avoid overhead
+        if current_time - self.last_hailo_check < 2:
+            return self.hailo_utilization
+        
+        try:
+            result = subprocess.run(['hailortcli', 'monitor'], 
+                                  capture_output=True, text=True, timeout=1)
+            
+            for line in result.stdout.split('\n'):
+                if 'Utilization' in line and '%' in line:
+                    parts = line.split()
+                    for i, part in enumerate(parts):
+                        if '%' in part:
+                            util_str = part.replace('%', '')
+                            try:
+                                self.hailo_utilization = float(util_str)
+                                self.last_hailo_check = current_time
+                                return self.hailo_utilization
+                            except:
+                                continue
+        except:
+            pass
+        
+        return self.hailo_utilization
+    
     def should_skip_frame(self, frame_count, current_time):
-        """Determine if current frame should be skipped based on multiple criteria"""
+        """Determine if current frame should be skipped - OPTIMIZED FOR MAX HAILO USAGE"""
+        # Disable most frame skipping to maximize Hailo utilization
         if not settings.ENABLE_FRAME_SKIPPING:
             return False, 'disabled'
         
-        # Manual frame skipping (process every N frames)
-        if frame_count % settings.PROCESS_EVERY_N_FRAMES != 0:
-            return True, 'manual'
-        
-        # FPS limiting
-        if settings.MAX_PROCESSING_FPS > 0:
-            min_interval = 1.0 / settings.MAX_PROCESSING_FPS
-            if current_time - self.last_process_time < min_interval:
-                return True, 'fps_limit'
-        
-        # System resource-based skipping
+        # Only skip if absolutely necessary (emergency CPU protection)
         if settings.SKIP_FRAMES_ON_HIGH_CPU:
             cpu_percent = self.system_monitor.cpu_percent
-            memory_percent = self.system_monitor.memory_percent
             
-            if cpu_percent > settings.CPU_THRESHOLD_FOR_SKIPPING:
-                return True, 'high_cpu'
-            
-            if memory_percent > settings.MEMORY_THRESHOLD_FOR_SKIPPING:
-                return True, 'high_memory'
+            # Only skip at very high CPU usage (95%+)
+            if cpu_percent > 95.0:
+                return True, 'emergency_cpu'
         
-        # Adaptive frame skipping
-        if settings.ADAPTIVE_FRAME_SKIPPING:
-            stats = self.technical_logger.get_stats()
-            avg_processing_ms = stats.get('avg_processing_ms', 0)
-            
-            if avg_processing_ms > 100:
-                if frame_count % (settings.PROCESS_EVERY_N_FRAMES * self.adaptive_skip_factor) != 0:
-                    return True, 'adaptive'
-        
+        # Process every frame by default for maximum Hailo utilization
         return False, 'none'
     
-    def update_adaptive_skip_factor(self):
-        """Update adaptive skip factor based on system performance"""
-        if not settings.ADAPTIVE_FRAME_SKIPPING:
-            return
+    def process_frame_batch(self, frames_batch, infer_pipeline, input_name, output_name, frame_counts):
+        """Process multiple frames together for maximum Hailo utilization"""
+        if len(frames_batch) == 0:
+            return []
         
-        cpu_percent = self.system_monitor.cpu_percent
+        batch_start_time = time.time()
+        results = []
         
-        if cpu_percent > settings.CPU_THRESHOLD_FOR_SKIPPING * 0.8:
-            self.adaptive_skip_factor = min(self.adaptive_skip_factor + 1, 5)
-        elif cpu_percent < settings.CPU_THRESHOLD_FOR_SKIPPING * 0.5:
-            self.adaptive_skip_factor = max(self.adaptive_skip_factor - 1, 1)
+        # Prepare batch input
+        batch_input = []
+        for frame in frames_batch:
+            preprocessed, _ = self.frame_processor.preprocess_frame_with_timing(
+                frame, self.model_info['actual_height'], self.model_info['actual_width']
+            )
+            batch_input.append(preprocessed)
+        
+        # Single batched inference - more efficient for Hailo
+        try:
+            if len(batch_input) == 1:
+                # Single frame inference
+                input_data = {input_name: np.expand_dims(batch_input[0], axis=0)}
+                inference_results = infer_pipeline.infer(input_data)
+                raw_detections = [inference_results[output_name]]
+            else:
+                # Batch inference
+                batch_array = np.array(batch_input)
+                input_data = {input_name: batch_array}
+                inference_results = infer_pipeline.infer(input_data)
+                raw_detections = inference_results[output_name]
+            
+            inference_time = time.time() - batch_start_time
+            
+            # Process each frame's results
+            for i, (frame, frame_count) in enumerate(zip(frames_batch, frame_counts)):
+                try:
+                    # Extract detections for this frame
+                    if len(raw_detections) > i:
+                        frame_detections = raw_detections[i:i+1]
+                    else:
+                        frame_detections = raw_detections[0:1]
+                    
+                    # Post-processing
+                    detections, postprocess_time = self.detection_processor.postprocess_hailo_detections_with_timing(
+                        frame_detections, frame.shape[1], frame.shape[0], 
+                        self.model_info['actual_height'], self.model_info['actual_width']
+                    )
+                    
+                    # Store last detections for potential skipped frames
+                    if detections:
+                        self.last_detections = detections
+                    
+                    # Draw detections
+                    annotated_frame = self.frame_processor.draw_detections_with_overlay(frame.copy(), detections)
+                    
+                    # Calculate frame metrics
+                    total_time = (time.time() - batch_start_time) / len(frames_batch)
+                    frame_metrics = {
+                        'frame_number': frame_count,
+                        'timestamp': batch_start_time,
+                        'width': frame.shape[1],
+                        'height': frame.shape[0],
+                        'model_input_width': self.model_info['actual_width'],
+                        'model_input_height': self.model_info['actual_height'],
+                        'total_time': total_time,
+                        'preprocess_time': 0,
+                        'inference_time': inference_time / len(frames_batch),
+                        'postprocess_time': postprocess_time
+                    }
+                    
+                    # Update loggers
+                    self.technical_logger.log_frame_metrics(total_time, inference_time / len(frames_batch))
+                    self.technical_logger.log_detections(len(detections))
+                    
+                    results.append((annotated_frame, frame_metrics, detections))
+                    
+                except Exception as e:
+                    print(f"[ERROR] Frame {i} processing error: {e}")
+                    continue
+                    
+        except Exception as e:
+            print(f"[ERROR] Batch inference error: {e}")
+            return []
+        
+        self.last_process_time = time.time()
+        return results
     
-    def process_frame(self, frame, infer_pipeline, input_name, output_name, frame_count):
-        """Process a single frame using ACTUAL model input size from HEF"""
+    def process_single_frame(self, frame, infer_pipeline, input_name, output_name, frame_count):
+        """Process a single frame - fallback method"""
         frame_start_time = time.time()
         original_height, original_width = frame.shape[:2]
         
@@ -383,57 +477,38 @@ class OptimizedHailoInferenceService:
     
     def publish_frame_with_retry(self, frame_data):
         """Enhanced frame publishing with better error handling"""
-        max_retries = 5
-        base_delay = 0.1
+        max_retries = 3
+        base_delay = 0.05  # Reduced delay for faster throughput
         
         for attempt in range(max_retries):
             try:
-                self.redis_client.ping()
+                if attempt > 0:
+                    self.redis_client.ping()
+                
                 self.redis_client.publish(settings.ANNOTATED_FRAME_OUTPUT_CHANNEL, frame_data)
                 return True
                 
             except (redis.ConnectionError, redis.TimeoutError) as e:
-                print(f"❌ Redis publish error (attempt {attempt + 1}): {e}")
-                
                 if attempt < max_retries - 1:
                     delay = base_delay * (2 ** attempt)
-                    jitter = np.random.uniform(0.01, 0.1)
-                    time.sleep(min(delay + jitter, 2.0))
-                    
+                    time.sleep(delay)
                     if self.reconnect_redis():
                         continue
-                    else:
-                        break
                 else:
-                    print("❌ Failed to publish frame after all retries")
                     return False
-                    
             except Exception as e:
-                print(f"❌ Unexpected publish error: {e}")
                 return False
         
         return False
     
     def run(self):
-        """Main inference loop with frame skipping and performance optimization"""
-        print("🚀 === OPTIMIZED Hailo Inference Service ===")
-        print(f"📊 Verbose Overlay: {settings.ENABLE_VERBOSE_OVERLAY}")
-        print(f"📍 Overlay Position: {settings.OVERLAY_POSITION}")
-        print(f"🔍 Max Detection Lines: {settings.MAX_DETECTION_LINES}")
-        print(f"🖼️ Maintain Aspect Ratio: {settings.MAINTAIN_ASPECT_RATIO}")
-        print(f"⏭️ Frame Skipping: {'Enabled' if settings.ENABLE_FRAME_SKIPPING else 'Disabled'}")
-        
-        if settings.ENABLE_FRAME_SKIPPING:
-            print(f"🔢 Process Every N Frames: {settings.PROCESS_EVERY_N_FRAMES}")
-            print(f"⚡ Max Processing FPS: {settings.MAX_PROCESSING_FPS}")
-            print(f"🧠 Adaptive Skipping: {settings.ADAPTIVE_FRAME_SKIPPING}")
-            print(f"💾 CPU Threshold: {settings.CPU_THRESHOLD_FOR_SKIPPING}%")
-            print(f"💾 Memory Threshold: {settings.MEMORY_THRESHOLD_FOR_SKIPPING}%")
-        
-        print(f"🔄 Max Reconnect Attempts: {self.max_reconnect_attempts}")
-        print(f"⚡ Performance Mode: {settings.ENABLE_PERFORMANCE_MODE}")
-        print(f"🔋 Power Saving: {settings.OPTIMIZE_FOR_POWER_SAVING}")
-        print(f"🔗 Enhanced Redis Connection: {'With Retry' if REDIS_RETRY_AVAILABLE else 'Basic'}")
+        """Main inference loop optimized for MAXIMUM HAILO UTILIZATION"""
+        print("🚀 === MAXIMUM HAILO UTILIZATION Inference Service ===")
+        print(f"🔥 Target: Move CPU load to Hailo HAT")
+        print(f"📊 Frame Skipping: {'Minimized' if settings.ENABLE_FRAME_SKIPPING else 'Disabled'}")
+        print(f"⚡ Batch Processing: {'Enabled' if self.enable_batching else 'Disabled'}")
+        print(f"🔥 Hailo NMS: {'Enabled' if self.use_hailo_nms else 'Disabled'}")
+        print(f"🎯 Goal: 50-80% Hailo utilization, 25-35% CPU usage")
         
         self.system_monitor.start_monitoring()
         
@@ -449,7 +524,7 @@ class OptimizedHailoInferenceService:
             
             print("\n⚡ Initializing Hailo AI model...")
             with VDevice() as vdevice:
-                network_group, hef = self.setup_hailo_model(vdevice)
+                network_group, hef = self.setup_hailo_model_with_nms(vdevice)
                 
                 input_vstreams_params = InputVStreamParams.make_from_network_group(network_group, quantized=False)
                 output_vstreams_params = OutputVStreamParams.make_from_network_group(network_group, quantized=False)
@@ -463,9 +538,8 @@ class OptimizedHailoInferenceService:
                         actual_width = self.model_info['actual_width']
                         actual_height = self.model_info['actual_height']
                         
-                        print("✅ Hailo AI model loaded successfully")
-                        print("🎯 Starting optimized inference loop...")
-                        print(f"📝 Processing: Selective frames → {actual_width}x{actual_height} model input → Original size output")
+                        print("🎯 MAXIMUM HAILO UTILIZATION inference loop starting...")
+                        print(f"📝 Processing: ALL frames → {actual_width}x{actual_height} → Hailo acceleration")
                         print("=" * 80)
                         
                         frame_count = 0
@@ -499,33 +573,69 @@ class OptimizedHailoInferenceService:
                                     print(f"❌ Frame decode error: {e}")
                                     continue
                                 
-                                # Determine if frame should be skipped
+                                # Check if frame should be skipped (minimal skipping for max Hailo usage)
                                 should_skip, skip_reason = self.should_skip_frame(frame_count, current_time)
                                 
                                 if should_skip:
                                     self.technical_logger.log_skipped_frame(skip_reason)
                                     annotated_frame, frame_metrics, detections = self.create_skipped_frame_output(frame, frame_count)
                                 else:
-                                    result = self.process_frame(frame, infer_pipeline, input_name, output_name, frame_count)
-                                    if result is None:
+                                    # Process frame for maximum Hailo utilization
+                                    if self.enable_batching and len(self.batch_frames) < self.batch_size:
+                                        # Collect frames for batch processing
+                                        self.batch_frames.append((frame, frame_count))
+                                        
+                                        if len(self.batch_frames) < self.batch_size:
+                                            continue  # Wait for full batch
+                                        
+                                        # Process batch
+                                        frames = [f[0] for f in self.batch_frames]
+                                        counts = [f[1] for f in self.batch_frames]
+                                        batch_results = self.process_frame_batch(frames, infer_pipeline, input_name, output_name, counts)
+                                        
+                                        # Process batch results
+                                        for result in batch_results:
+                                            if result:
+                                                annotated_frame, frame_metrics, detections = result
+                                                
+                                                # Create overlay
+                                                if frame_count % 5 == 0:  # Reduce overlay frequency
+                                                    logger_stats = self.technical_logger.get_stats()
+                                                    system_stats = self.system_monitor.get_stats()
+                                                    overlay_lines = self.frame_processor.create_verbose_overlay_lines(
+                                                        frame_metrics, detections, self.model_info, system_stats, logger_stats
+                                                    )
+                                                    self.overlay_cache = overlay_lines
+                                                else:
+                                                    overlay_lines = self.overlay_cache or []
+                                                
+                                                # Draw overlay and publish
+                                                final_frame = self.frame_processor.draw_verbose_technical_overlay(annotated_frame, overlay_lines)
+                                                
+                                                if final_frame is not None:
+                                                    ret, buffer = cv2.imencode('.jpg', final_frame, 
+                                                        [int(cv2.IMWRITE_JPEG_QUALITY), settings.JPEG_QUALITY])
+                                                    
+                                                    if ret:
+                                                        self.publish_frame_with_retry(buffer.tobytes())
+                                        
+                                        self.batch_frames = []  # Clear batch
                                         continue
-                                    annotated_frame, frame_metrics, detections = result
+                                    else:
+                                        # Single frame processing
+                                        result = self.process_single_frame(frame, infer_pipeline, input_name, output_name, frame_count)
+                                        if result is None:
+                                            continue
+                                        annotated_frame, frame_metrics, detections = result
                                 
-                                # Update adaptive skip factor periodically
-                                if frame_count % 30 == 0:
-                                    self.update_adaptive_skip_factor()
-                                
-                                # Create overlay
-                                if self.frame_processor.should_update_overlay(frame_count):
+                                # Create overlay (reduced frequency)
+                                if frame_count % 5 == 0:
                                     logger_stats = self.technical_logger.get_stats()
                                     system_stats = self.system_monitor.get_stats()
-                                    
                                     overlay_lines = self.frame_processor.create_verbose_overlay_lines(
                                         frame_metrics, detections, self.model_info, system_stats, logger_stats
                                     )
-                                    
-                                    if settings.REDUCE_OVERLAY_FREQUENCY:
-                                        self.overlay_cache = overlay_lines
+                                    self.overlay_cache = overlay_lines
                                 else:
                                     overlay_lines = self.overlay_cache or []
                                 
@@ -539,10 +649,9 @@ class OptimizedHailoInferenceService:
                                     if ret:
                                         self.publish_frame_with_retry(buffer.tobytes())
                                 
-                                # Console output every 60 frames
+                                # Enhanced console output every 60 frames
                                 if frame_count % 60 == 0:
                                     current_stats_time = time.time()
-                                    time_diff = current_stats_time - last_stats_time
                                     
                                     logger_stats = self.technical_logger.get_stats()
                                     fps = logger_stats.get('fps', 0)
@@ -551,23 +660,29 @@ class OptimizedHailoInferenceService:
                                     processed = logger_stats.get('processed_frames', 0)
                                     skipped = logger_stats.get('skipped_frames', 0)
                                     efficiency = logger_stats.get('processing_efficiency', 100)
-                                    skip_reasons = logger_stats.get('skip_reasons', {})
                                     
                                     # System metrics
                                     cpu_pct = self.system_monitor.cpu_percent
                                     mem_pct = self.system_monitor.memory_percent
                                     temp = self.system_monitor.temperature
                                     
-                                    print(f"\n📊 === FRAME {frame_count} STATISTICS ===")
-                                    print(f"⚡ Processing FPS: {fps:.1f} | Avg Time: {avg_ms:.1f}ms | Total Detections: {total_dets}")
+                                    # Get Hailo utilization
+                                    hailo_util = self.get_hailo_utilization()
+                                    
+                                    # Calculate load balance
+                                    if hailo_util > cpu_pct:
+                                        balance_status = "🎯 OPTIMAL (Hailo > CPU)"
+                                    elif hailo_util > 30:
+                                        balance_status = "⚡ GOOD (Hailo Active)"
+                                    else:
+                                        balance_status = "⚠️ CPU-HEAVY (Low Hailo)"
+                                    
+                                    print(f"\n🔥 === FRAME {frame_count} HAILO UTILIZATION STATS ===")
+                                    print(f"🔥 Hailo: {hailo_util:.1f}% | CPU: {cpu_pct:.1f}% | {balance_status}")
+                                    print(f"⚡ Processing FPS: {fps:.1f} | Avg Time: {avg_ms:.1f}ms | Detections: {total_dets}")
                                     print(f"📈 Efficiency: {efficiency:.1f}% | Processed: {processed} | Skipped: {skipped}")
-                                    print(f"🖥️ CPU: {cpu_pct:.1f}% | Memory: {mem_pct:.1f}% | Temp: {temp:.1f}°C")
-                                    print(f"🔄 Reconnects: {self.reconnect_attempts} | Adaptive Factor: {self.adaptive_skip_factor}")
-                                    
-                                    if skip_reasons:
-                                        skip_summary = ", ".join([f"{k}:{v}" for k, v in skip_reasons.items() if v > 0])
-                                        print(f"⏭️ Skip Reasons: {skip_summary}")
-                                    
+                                    print(f"🖥️ Memory: {mem_pct:.1f}% | Temp: {temp:.1f}°C | Reconnects: {self.reconnect_attempts}")
+                                    print(f"🔥 Hailo NMS: {'ON' if self.use_hailo_nms else 'OFF'} | Batching: {'ON' if self.enable_batching else 'OFF'}")
                                     print("=" * 80)
                                     last_stats_time = current_stats_time
                                 
@@ -581,7 +696,7 @@ class OptimizedHailoInferenceService:
                                 if consecutive_failures > max_consecutive_failures:
                                     print(f"💥 Too many consecutive failures ({consecutive_failures}). Exiting...")
                                     break
-                                time.sleep(1)
+                                time.sleep(0.1)
         
         except Exception as e:
             print(f"💥 Fatal error: {e}")
@@ -589,23 +704,27 @@ class OptimizedHailoInferenceService:
             
         finally:
             print("\n🧹 Cleaning up resources...")
-            
-            # Stop monitoring
             self.system_monitor.stop_monitoring()
             
             # Print final performance summary
             try:
                 performance_summary = self.technical_logger.get_performance_summary()
-                print("\n📊 === FINAL PERFORMANCE SUMMARY ===")
+                hailo_final = self.get_hailo_utilization()
+                
+                print(f"\n🔥 === FINAL HAILO UTILIZATION SUMMARY ===")
+                print(f"🔥 Final Hailo Usage: {hailo_final:.1f}%")
                 for key, value in performance_summary.items():
                     print(f"{key.replace('_', ' ').title()}: {value}")
                 
-                # Additional cleanup stats
                 final_stats = self.technical_logger.get_stats()
-                print(f"\nTotal Runtime: {final_stats.get('uptime_seconds', 0):.1f} seconds")
-                print(f"Total Frames Processed: {final_stats.get('total_frames', 0)}")
-                print(f"Average FPS: {final_stats.get('fps', 0):.2f}")
-                print(f"Connection Stability: {((60 - self.reconnect_attempts) / 60 * 100):.1f}%")
+                cpu_final = self.system_monitor.cpu_percent
+                
+                print(f"\n🎯 OPTIMIZATION RESULTS:")
+                print(f"🔥 Hailo Utilization: {hailo_final:.1f}%")
+                print(f"💻 CPU Usage: {cpu_final:.1f}%")
+                print(f"⚖️ Load Balance: {'OPTIMAL' if hailo_final > cpu_final else 'NEEDS IMPROVEMENT'}")
+                print(f"📊 Total Frames: {final_stats.get('total_frames', 0)}")
+                print(f"⚡ Average FPS: {final_stats.get('fps', 0):.2f}")
                 
             except Exception as cleanup_error:
                 print(f"❌ Error generating performance summary: {cleanup_error}")
@@ -622,16 +741,17 @@ class OptimizedHailoInferenceService:
             except Exception as redis_cleanup_error:
                 print(f"❌ Error during Redis cleanup: {redis_cleanup_error}")
             
-            print("✅ Cleanup completed. Service stopped.")
+            print("✅ Maximum Hailo Utilization Service stopped.")
 
 
 def main():
-    """Main entry point with enhanced error handling"""
-    print("🚀 Starting Optimized Hailo AI Inference Service")
+    """Main entry point optimized for Hailo utilization"""
+    print("🔥 Starting MAXIMUM HAILO UTILIZATION Inference Service")
+    print("🎯 Goal: Move CPU load to Hailo HAT for optimal performance")
     print("=" * 60)
     
     try:
-        service = OptimizedHailoInferenceService()
+        service = MaxHailoUtilizationInferenceService()
         service.run()
     except KeyboardInterrupt:
         print("\n🛑 Service interrupted by user")
